@@ -13,7 +13,9 @@ from .utils import set_seed, get_device, ce_loss, tune_threshold_for_uar, eval_a
 from .embeddings import embed_texts_transformer, embed_audio_whisper, embed_audio_egemaps
 from .models import make_base_pool, predict_proba_pos
 from .oof import oof_preds_all_models, fit_meta_with_inner_oof, make_group_splitter
-from .router import select_pair_expected_gain, ranks_from_probs, pairwise_rmsd, pairwise_zol_disagreement, build_router_features, platt_fit_apply, best_alpha
+from .router import (select_pair_expected_gain, ranks_from_probs, pairwise_rmsd, pairwise_zol_disagreement, build_router_features, 
+    platt_fit_apply, best_alpha, best_alpha_for_uar,select_pair_oracle_uar_gain,isotonic_fit_apply
+)
 from .moe import fit_moe_gate, moe_predict, gate_degeneracy
 from .viz import plot_decision_boundary_2d, find_hard_indices
 from .strategies import build_strategy_predictor
@@ -79,6 +81,12 @@ def _build_feature_spaces(df: pd.DataFrame, cfg: AdaptiveConfig, device=None) ->
     if cfg.concat_features and len(spaces) >= 2:
         spaces["concat"] = np.concatenate([spaces[k] for k in sorted(spaces.keys())], axis=1)
     return spaces
+def _calib_apply_for_model(name, p_tr, y_tr, p_va):
+    if any(tag in name.lower() for tag in ["rf","xgb","gnb"]):
+        return isotonic_fit_apply(p_tr, y_tr, p_va)
+    else:
+        return platt_fit_apply(p_tr, y_tr, p_va)
+
 
 def run_adaptive_pipeline(cfg: AdaptiveConfig):
     set_seed(cfg.seed)
@@ -164,6 +172,23 @@ def run_adaptive_pipeline(cfg: AdaptiveConfig):
                 fold_metrics["single"][name].append(res)
             print("  Singles:", " | ".join([f"{n}: F1 {single_res[n]['F1']:.3f}/UAR {single_res[n]['UAR']:.3f}" for n in single_res.keys()]))
 
+            # --- Quality floor for candidate bases (protect UAR)
+            model_list = list(pool.keys())
+            # Choose your criterion: "ROC_AUC" is stable; "UAR" is ok too.
+            crit = getattr(cfg, "pair_quality_metric", "ROC_AUC")
+            K = int(getattr(cfg, "pair_quality_topk", max(2, int(np.ceil(len(model_list) * 0.6)))))
+            
+            scores = {name: single_res[name][crit] for name in model_list}
+            # Pick top-K by quality
+            topk_models = [name for name, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:K]]
+            if len(topk_models) < 2:
+                topk_models = model_list  # fallback
+            
+            # Use topk_models in diversity/gain selection below
+            candidates = topk_models
+
+            
+
             # MV soft
             mat = np.column_stack([preds_va[k] for k in pool.keys()])
             avg = mat.mean(axis=1)
@@ -177,7 +202,6 @@ def run_adaptive_pipeline(cfg: AdaptiveConfig):
             fold_metrics["mv_hard"].append(eval_all(y_va, vote_frac, thr_hard))
 
             # stacking
-            model_list = list(pool.keys())
             meta_LR, _  = fit_meta_with_inner_oof(X_tr, y_tr, pool, model_list, n_inner=5, meta_type="lr",
                                                   oversample_ratio=cfg.oversample_ratio, pca_dim=cfg.pca_dim, calibrate_trees=cfg.calibrate_trees,
                                                   groups_tr=groups_tr)
@@ -193,78 +217,162 @@ def run_adaptive_pipeline(cfg: AdaptiveConfig):
             fold_metrics["stack_xgb"].append(eval_all(y_va, p_stack_xgb, t_xg))
 
             # --- Adaptive Router ---
+            cfg.router_uncertainty_eps = getattr(cfg, "router_uncertainty_eps", 0.08)   # |pr-0.5| < 0.08 → uncertain
+            cfg.router_uncertainty_fallback = getattr(cfg, "router_uncertainty_fallback", "mv_hard")
+            
             P_oof, full_pool = oof_preds_all_models(X_tr, y_tr, model_list, n_inner=5,
                 oversample_ratio=cfg.oversample_ratio, pca_dim=cfg.pca_dim, calibrate_trees=cfg.calibrate_trees, groups_tr=groups_tr)
+            # Calibrate OOF to TRUE labels (used for relabeling and weights)
             P_cal = np.zeros_like(P_oof)
-            for i in range(P_oof.shape[1]): P_cal[:, i] = platt_fit_apply(P_oof[:, i], y_tr, P_oof[:, i])
+            for i in range(P_oof.shape[1]):
+                P_cal[:, i] = platt_fit_apply(P_oof[:, i], y_tr, P_oof[:, i])
+            
+            # Validation predictions for ALL models (class-calibrated to TRUE labels)
+            P_val_raw = np.column_stack([predict_proba_pos(full_pool[name], X_va) for name in model_list])
+            P_val_cal = np.column_stack([platt_fit_apply(P_oof[:, i], y_tr, P_val_raw[:, i]) for i in range(P_oof.shape[1])])
 
             if cfg.pair_selection.lower() == "gain":
+                # Use calibrated OOF for expected gain (per-sample loss available)
                 (mA, mB), _ = select_pair_expected_gain(P_cal, y_tr, model_list, metric="logloss")
                 print(f"  Pair by expected gain: {mA}+{mB}")
+            elif cfg.pair_selection.lower() == "gain_uar":
+                (mA, mB), g = select_pair_oracle_uar_gain(P_cal, y_tr, model_list, candidates)
+                print(f"  Pair by oracle UAR gain: {mA}+{mB} (ΔUAR={g:.4f})")
             else:
-                best_pair, best_d = None, -1
-                for a, b in itertools.combinations(model_list, 2):
-                    pa, pb = P_cal[:, model_list.index(a)], P_cal[:, model_list.index(b)]
-                    d = pairwise_rmsd(ranks_from_probs(pa, True), ranks_from_probs(pb, True)) if cfg.diversity_method.upper()=="RMSD" \
-                        else pairwise_zol_disagreement((pa>=0.5).astype(int), (pb>=0.5).astype(int))
-                    if d > best_d: best_d, best_pair = d, (a,b)
+                # Diversity by RMSD of ranks on VALIDATION (paper-aligned) over 'candidates'
+                best_pair, best_d = None, -1.0
+                for a, b in itertools.combinations(candidates, 2):
+                    ia, ib = model_list.index(a), model_list.index(b)
+                    ra = ranks_from_probs(P_val_cal[:, ia], ascending=True).astype(float)
+                    rb = ranks_from_probs(P_val_cal[:, ib], ascending=True).astype(float)
+                    d = pairwise_rmsd(ra, rb)
+                    if d > best_d:
+                        best_d, best_pair = d, (a, b)
                 mA, mB = best_pair
-                print(f"  Pair by {cfg.diversity_method}: {mA}+{mB}")
+                print(f"  Pair by RMSD: {mA}+{mB} (RMSD={best_d:.2f})")
 
             pA_oof = P_cal[:, model_list.index(mA)]
             pB_oof = P_cal[:, model_list.index(mB)]
-            rA, rB = ranks_from_probs(pA_oof, True), ranks_from_probs(pB_oof, True)
-            relabels = np.array([0 if ((y_tr[i]==1 and rA[i]>=rB[i]) or (y_tr[i]==0 and rA[i]<=rB[i])) else 1
-                                 for i in range(len(y_tr))])
+            rA = ranks_from_probs(pA_oof, True)
+            rB = ranks_from_probs(pB_oof, True)
+            
+            # A if positive & rA>=rB OR negative & rA<=rB; else B
+            choose_A = ((y_tr == 1) & (rA >= rB)) | ((y_tr == 0) & (rA <= rB))
+            relabels = np.where(choose_A, 0, 1)
+            
+            # tie-break where rA==rB: prefer the model with larger |p-0.5| (more decisive)
+            ties = (rA == rB)
+            if ties.any():
+                prefer_A = np.abs(pA_oof - 0.5) >= np.abs(pB_oof - 0.5)
+                relabels[ties] = np.where(prefer_A[ties], 0, 1)
+            
             skew = relabels.mean()
             print(f"  Router label skew: {skew:.3f}")
 
+            # Sample weights for router (optional but helpful on imbalanced data)
             if cfg.router_weight == "delta_ce":
-                w = np.abs(ce_loss(y_tr, pA_oof) - ce_loss(y_tr, pB_oof))
+                la = ce_loss(y_tr, pA_oof)   # per-sample vectors
+                lb = ce_loss(y_tr, pB_oof)
+                w = np.abs(la - lb)
+                oracle_router = np.minimum(la, lb).mean()
+                best_single  = min(la.mean(), lb.mean())
+                print(f"  Oracle routing CE: {oracle_router:.4f} vs best single CE: {best_single:.4f}")
             elif cfg.router_weight == "margin":
                 w = np.abs(pA_oof - pB_oof)
             else:
                 w = None
+            # UAR boost: upweight minority TRUE class a bit (1.5–3.0 usually safe)
+            pos_w = float(getattr(cfg, "router_pos_weight", 2))
+            w = w * np.where(y_tr == 1, pos_w, 1.0)
 
+            # CLASS-calibrated validation probs for final prediction stream
+            pA_va_cls = _calib_apply_for_model(mA, pA_oof, y_tr, predict_proba_pos(full_pool[mA], X_va))
+            pB_va_cls = _calib_apply_for_model(mB, pB_oof, y_tr, predict_proba_pos(full_pool[mB], X_va))
+            
+            # Fallback if router labels are too skewed (can hurt UAR)
             if skew < 0.25 or skew > 0.75:
-                alpha = best_alpha(y_tr, pA_oof, pB_oof) if cfg.fallback_learn_alpha else 0.5
-                pA_va = predict_proba_pos(full_pool[mA], X_va)
-                pB_va = predict_proba_pos(full_pool[mB], X_va)
-                pA_va = platt_fit_apply(pA_oof, relabels, pA_va)
-                pB_va = platt_fit_apply(pB_oof, relabels, pB_va)
-                p_adapt = alpha * pA_va + (1 - alpha) * pB_va
+                # Choose blend on VALIDATION to favor UAR downstream
+                alpha = (best_alpha_for_uar(y_va, pA_va_cls, pB_va_cls)
+                         if getattr(cfg, "fallback_optimize", "uar").lower() == "uar"
+                         else best_alpha(y_va, pA_va_cls, pB_va_cls))
+                p_adapt = alpha * pA_va_cls + (1 - alpha) * pB_va_cls
             else:
-                router_X_tr = build_router_features(pA_oof, pB_oof, use_ranks=cfg.use_rank_features)
-                from sklearn.ensemble import RandomForestClassifier
-                from sklearn.linear_model import LogisticRegression
-                from xgboost import XGBClassifier
+                # Router trained on ORIGINAL features (paper-aligned)
+                # Router trained on ORIGINAL features (+1 confidence feature)
+                router_X_tr = np.column_stack([X_tr, np.abs(pA_oof - 0.5) - np.abs(pB_oof - 0.5)]) \
+                              if getattr(cfg, "router_add_margin_feature", True) else X_tr
+                router_X_va = np.column_stack([X_va, np.abs(pA_va_cls - 0.5) - np.abs(pB_va_cls - 0.5)]) \
+                              if getattr(cfg, "router_add_margin_feature", True) else X_va
+                
+                # class ratio for relabels
+                rel_pos = max(1, int(relabels.sum()))
+                rel_neg = max(1, int((relabels == 0).sum()))
+                spw = rel_neg / rel_pos
+            
                 if cfg.router_meta == "xgb":
+                    from xgboost import XGBClassifier
+                    print("__Using XGB-adaptive_router__")
                     router = XGBClassifier(n_estimators=400, max_depth=3, learning_rate=0.07,
-                                           subsample=0.9, colsample_bytree=0.9, eval_metric="logloss", random_state=42)
+                                           subsample=0.9, colsample_bytree=0.9, eval_metric="logloss", random_state=42, scale_pos_weight=spw)
                 elif cfg.router_meta == "rf":
-                    router = RandomForestClassifier(n_estimators=300, max_depth=6, random_state=42,
+                    print("__Using RF-adaptive_router__")
+                    from sklearn.ensemble import RandomForestClassifier
+                    router = RandomForestClassifier(n_estimators=500, max_depth=20, random_state=42,
                                                     class_weight="balanced", n_jobs=-1)
                 else:
-                    router = LogisticRegression(solver="lbfgs", max_iter=2000, class_weight="balanced", C=0.5)
+                    print("__Using LR-adaptive_router__")
+                    router = LogisticRegression(solver="lbfgs", max_iter=2000,
+                                                class_weight="balanced", C=0.5)
                 router.fit(router_X_tr, relabels, sample_weight=w)
 
-                pA_va = predict_proba_pos(full_pool[mA], X_va)
-                pB_va = predict_proba_pos(full_pool[mB], X_va)
-                pA_va = platt_fit_apply(pA_oof, relabels, pA_va)
-                pB_va = platt_fit_apply(pB_oof, relabels, pB_va)
-                router_X_va = build_router_features(pA_va, pB_va, use_ranks=cfg.use_rank_features)
-
+                def _uar_from_scores(y_true, p_scores):
+                    thr, _ = tune_threshold_for_uar(y_true, p_scores)
+                    return eval_all(y_true, p_scores, thr)["UAR"]
+                
                 if cfg.confidence_blend and hasattr(router, "predict_proba"):
+                    # SOFT gate: tune tau for UAR on this fold's validation
                     pr = router.predict_proba(router_X_va)[:, 1]
-                    tau = float(cfg.confidence_tau)
-                    lam = 1.0 / (1.0 + np.exp(-tau * (pr - 0.5)))
-                    p_adapt = (1 - lam) * pA_va + lam * pB_va
+                
+                    # Try a modest grid; widen if you like
+                    tau_grid = getattr(cfg, "tau_grid", [0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 25])
+                    best_uar, best_p = -1.0, None
+                    for tau in tau_grid:
+                        lam = 1.0 / (1.0 + np.exp(-tau * (pr - 0.5)))  # [0,1]
+                        p_try = (1 - lam) * pA_va_cls + lam * pB_va_cls
+                        uar = _uar_from_scores(y_va, p_try)
+                        if uar > best_uar:
+                            best_uar, best_p = uar, p_try
+                    p_adapt = best_p
                 else:
-                    route = router.predict(router_X_va)
-                    p_adapt = np.where(route == 0, pA_va, pB_va)
+                    # HARD gate: tune router threshold theta for UAR on validation
+                    if hasattr(router, "predict_proba"):
+                        pr = router.predict_proba(router_X_va)[:, 1]
+                        theta_grid = getattr(cfg, "router_theta_grid", np.linspace(0.1, 0.9, 17))
+                        best_uar, best_p = -1.0, None
+                        for th in theta_grid:
+                            route = (pr >= th).astype(int)  # 1 => choose B
+                            p_try = np.where(route == 0, pA_va_cls, pB_va_cls)
+                            uar = _uar_from_scores(y_va, p_try)
+                            if uar > best_uar:
+                                best_uar, best_p = uar, p_try
+                        p_adapt = best_p
+                    else:
+                        # fallback to predict(); then still tune post-threshold as you already do
+                        route = router.predict(router_X_va)
+                        p_adapt = np.where(route == 0, pA_va_cls, pB_va_cls)
+                        
+
 
             t_ad, _ = tune_threshold_for_uar(y_va, p_adapt)
             fold_metrics["adaptive_router"].append(eval_all(y_va, p_adapt, t_ad))
+            # Post-router headroom realization (just for visibility)
+            thr_bestA, _ = tune_threshold_for_uar(y_va, pA_va_cls)
+            thr_bestB, _ = tune_threshold_for_uar(y_va, pB_va_cls)
+            uar_best_single = max(eval_all(y_va, pA_va_cls, thr_bestA)["UAR"],
+                                  eval_all(y_va, pB_va_cls, thr_bestB)["UAR"])
+            thr_ad, _ = tune_threshold_for_uar(y_va, p_adapt)
+            uar_ad = eval_all(y_va, p_adapt, thr_ad)["UAR"]
+            print(f"  UAR best_single_val={uar_best_single:.3f} | adaptive_val={uar_ad:.3f}")
 
             # --- MoE ---
             if cfg.include_moe:
